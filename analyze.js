@@ -17,14 +17,19 @@ limitations under the License.
 var EMPTY_STACK = "	<empty stack>";
 var generatedIdCounter = 1;
 
-// This method is called from HTML
 function analyzeTextfield() {
+    clearAnalysis();
+    clearFile();
     var text = document.getElementById("TEXTAREA").value;
-    analyze(text);
+    var selectedDump = getSelectedDump();
+    updateOptions(getDumpCount(text),selectedDump);
+    analyze(text,selectedDump);
 }
 
 // This method is called from HTML so we need to tell ESLint it's not unused
 function analyzeFile() { // eslint-disable-line no-unused-vars
+    clearAnalysis();
+    clearTextField();
     var fileNode = document.getElementById("FILE");
     if (fileNode.files.length > 0) {
         var file = fileNode.files[0];
@@ -32,14 +37,54 @@ function analyzeFile() { // eslint-disable-line no-unused-vars
         fileReader.readAsText(file);
         fileReader.onloadend = function(){
             var text = fileReader.result;
-            analyze(text);
+            var selectedDump = getSelectedDump();
+            updateOptions(getDumpCount(text),selectedDump);
+            analyze(text,selectedDump);
         };
     }
 }
 
+function getDumpCount(text){
+    var lastDumpIndexStart = text.lastIndexOf("!!!Thread Dump")+15;
+    var lastDumpIndexEnd = text.indexOf('|',lastDumpIndexStart);
+    return text.substr(lastDumpIndexStart,lastDumpIndexEnd-lastDumpIndexStart);
+}
 
-function analyze(text) {
-    var analyzer = new Analyzer(text);
+function getSelectedDump(){
+    var selectedDump = document.getElementById("dumpNum").value;
+    if(selectedDump==''){
+        return 1;
+    }
+    return selectedDump;
+}
+
+function clearOptions(){
+    var selectElement = document.getElementById("dumpNum");
+    var i, L = selectElement.options.length - 1;
+    for(i = L; i >= 0; i--) {
+       selectElement.remove(i);
+    }
+}
+
+function updateOptions(dumpCount,selectedDump) {
+    clearOptions();
+    document.getElementById("DUMP_HEADER").innerHTML = "Found "+dumpCount+" heaps. Heap "+selectedDump+ " selected";
+    document.getElementById("DUMP_SELECT").style.display = "unset";
+    var selectElement = document.getElementById("dumpNum");
+    for(var i = 1; i<= dumpCount;i++){
+        var option = document.createElement("option");
+        option.text = i;
+        option.value = i;
+        if(selectedDump==i){
+            option.selected = true;
+        }
+        selectElement.add(option);
+    }
+ }
+
+
+function analyze(text,dumpNumber) {
+    var analyzer = new Analyzer(text,dumpNumber);
     setHtml("OUTPUT", analyzer.toHtml());
 
     var ignores = analyzer.toIgnoresHtml();
@@ -58,12 +103,28 @@ function analyze(text) {
 }
 
 // This method is called from HTML so we need to tell ESLint it's not unused
-function clearTextfield() { // eslint-disable-line no-unused-vars
-    var textArea = document.getElementById("TEXTAREA");
-    textArea.value = "";
+function clearAll() { // eslint-disable-line no-unused-vars
+    clearTextField();
+    clearFile();
+    clearAnalysis();
+    clearOptions();
+}
 
-    // Clear the analysis as well
-    analyzeTextfield();
+function clearTextField(){
+    document.getElementById("TEXTAREA").value = "";
+}
+
+function clearFile(){
+    document.getElementById("FILE").value = "";
+}
+
+function clearAnalysis(){
+    document.getElementById("RUNNING_DIV").style.display = "none";
+    document.getElementById("OUTPUT_DIV").style.display = "none";
+    document.getElementById("SYNCHRONIZERS_DIV").style.display = "none";
+    document.getElementById("IGNORED_DIV").style.display = "none";
+    document.getElementById("DUMP_SELECT").style.display = "none";
+
 }
 
 function htmlEscape(unescaped) {
@@ -196,7 +257,7 @@ function Thread(line) {
             return true;
         }
 
-        var THREAD_STATE = /^\s*java.lang.Thread.State: (.*)/;
+        var THREAD_STATE = /\s*state=(.*)\|/;
         match = line.match(THREAD_STATE);
         if (match !== null) {
             this.threadState = match[1];
@@ -244,6 +305,17 @@ function Thread(line) {
             default:
                 return false;
             }
+        }
+
+        var BLOCKED_STATUS = /LockOwnerName=(.*)\sLockOwnerId=(.*)\sLockName=(.*)/;
+        match = line.match(BLOCKED_STATUS);
+        if (match !== null) {
+            var ownerName = match[1];
+            var ownerId = match[2];
+            var className = match[3];
+            this.synchronizerClasses[ownerId] = ownerName;
+            this.wantToAcquire = ownerId;
+            return true;
         }
 
         var HELD_LOCK = /^\s+- <([x0-9a-f]+)> \(a (.*)\)/;
@@ -328,7 +400,7 @@ function Thread(line) {
     this.nid = match.value;
     line = match.shorterString;
 
-    match = _extract(/ tid=([0-9a-fx,]+)/, line);
+    match = _extract(/ id=([0-9a-fx,]+)/, line);
     this.tid = match.value;
     line = match.shorterString;
 
@@ -338,7 +410,7 @@ function Thread(line) {
         line = match.shorterString;
     }
 
-    match = _extract(/ prio=([0-9]+)/, line);
+    match = _extract(/ priority=([0-9]+)/, line);
     this.prio = match.value;
     line = match.shorterString;
 
@@ -569,13 +641,14 @@ function synchronizerComparator(a, b) {
 }
 
 // Create an analyzer object
-function Analyzer(text) {
+function Analyzer(text,dumpNumber) {
     this._handleLine = function(line) {
         var thread = new Thread(line);
         var parsed = false;
         if (thread.isValid()) {
             this.threads.push(thread);
             this._currentThread = thread;
+            this._currentThread.addStackLine(line);
             parsed = true;
         } else if (/^\s*$/.exec(line)) {
             // We ignore empty lines, and lines containing only whitespace
@@ -621,7 +694,7 @@ function Analyzer(text) {
         // Thread headers start with ", this is not it
         return false;
       }
-      if (line.indexOf("prio=") !== -1) {
+      if (line.indexOf("priority=") !== -1) {
         // Thread header contains "prio=" => we think it's complete
         return false;
       }
@@ -637,22 +710,48 @@ function Analyzer(text) {
       return true;
     };
 
-    this._analyze = function(text) {
+    this._analyze = function(text,dumpNumber) {
         var lines = text.split("\n");
+        let LOGGER_REGEX = /\[.*\]\|\[INFO\]\|\[..\]:\s/;
+        let DUMP_NUM_REGEX = /!!!Thread Dump (.)\|/;
+        let DUMP_FINISH_REGEX = /Thread Dump Finished!!!/;
+        var parse = false;
+        let customMatch;
         for (var i = 0; i < lines.length; i++) {
             var line = lines[i];
-            while (this._isIncompleteThreadHeader(line)) {
-                // Multi line thread name
-                i++;
-                if (i >= lines.length) {
+            customMatch = line.match(LOGGER_REGEX);
+            if (customMatch !== null) {
+                line = line.replace(LOGGER_REGEX, "");
+                customMatch = line.match(DUMP_NUM_REGEX);
+                if(customMatch !== null){
+                    let c = customMatch[1];
+                    if(c==dumpNumber){
+                        parse = true;
+                    }else {
+                        parse = false;
+                    }
+                    continue;
+                }
+            }
+            if(parse){
+                customMatch = line.match(DUMP_FINISH_REGEX);
+                if(customMatch !== null){
                     break;
                 }
-
-                // Replace thread name newline with ", "
-                line += ", " + lines[i];
+                while (this._isIncompleteThreadHeader(line)) {
+                    // Multi line thread name
+                    i++;
+                    if (i >= lines.length) {
+                        break;
+                    }
+    
+                    // Replace thread name newline with ", "
+                    line += ", " + lines[i];
+                }
+    
+                this._handleLine(line);
             }
 
-            this._handleLine(line);
         }
 
         this._identifyWaitedForSynchronizers();
@@ -949,8 +1048,18 @@ function Analyzer(text) {
     this._ignores = new StringCounter();
     this._currentThread = null;
 
-    this._analyze(text);
+    this._analyze(text,dumpNumber);
     this.countedRunningMethods = this._countRunningMethods();
     this._synchronizerById = this._createSynchronizerById();
     this._synchronizers = this._enumerateSynchronizers();
+}
+
+
+function checkAndAnalyze(){
+    var text = document.getElementById("TEXTAREA").value;
+    if(text.trim()!=""){
+        analyzeTextfield();
+    }else{
+        analyzeFile();
+    }
 }
